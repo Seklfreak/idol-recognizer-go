@@ -5,12 +5,39 @@ import (
 
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/urfave/cli"
 	"gopkg.in/ini.v1"
 )
+
+func runAddFaceToPersonFromFile(fpp facepp.Facepp, personName string, fileLocation string) {
+	detectedFace, err := fpp.DetectionDetectFile(fileLocation, "", "")
+	if err != nil {
+		fmt.Println(fileLocation, "failed:", err.Error())
+	} else {
+		if len(detectedFace.Face) <= 0 {
+			fmt.Println(fileLocation, "failed:", "unable to find face in picture")
+		} else {
+			if len(detectedFace.Face) > 1 {
+				fmt.Println(fileLocation, "failed:", "found too many faces in picture (found "+strconv.Itoa(len(detectedFace.Face))+")")
+			} else {
+				addedFaces, err := fpp.PersonAddFace(personName, detectedFace.Face[0].Face_id)
+				if err != nil {
+					fmt.Println(fileLocation, "failed:", err.Error())
+				} else {
+					if addedFaces.Success != true {
+						fmt.Println(fileLocation, "failed:", "api error")
+					} else {
+						fmt.Println(fileLocation, "added", addedFaces.Added, "face to person", personName)
+					}
+				}
+			}
+		}
+	}
+}
 
 func main() {
 	var app = cli.NewApp()
@@ -24,10 +51,12 @@ func main() {
 
 	if !cfg.Section("faceplusplus").HasKey("api key") &&
 		!cfg.Section("faceplusplus").HasKey("api secret") &&
-		!cfg.Section("faceplusplus").HasKey("api url") {
+		!cfg.Section("faceplusplus").HasKey("api url") &&
+		!cfg.Section("faceplusplus").HasKey("concurrent requests") {
 		cfg.Section("faceplusplus").NewKey("api key", "yourapikey")
 		cfg.Section("faceplusplus").NewKey("api secret", "yourapisecret")
 		cfg.Section("faceplusplus").NewKey("api url", "https://apius.faceplusplus.com")
+		cfg.Section("faceplusplus").NewKey("concurrent requests", "3")
 		err = cfg.SaveTo("config.ini")
 
 		if err != nil {
@@ -45,12 +74,36 @@ func main() {
 	var imageUrl string
 	var imageFileLocation string
 	var block bool
+	var tag string
 
 	app.Commands = []cli.Command{
 		{
 			Name:  "person",
 			Usage: "manage persons",
 			Subcommands: []cli.Command{
+				{
+					Name:      "create",
+					Usage:     "creates a new person",
+					ArgsUsage: "<person name> <group name>",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "tag",
+							Usage:       "tag of the person you want to add",
+							Destination: &tag,
+						},
+					},
+					Action: func(c *cli.Context) error {
+						if c.Args().Get(0) == "" || c.Args().Get(1) == "" {
+							return cli.NewExitError("not enough arguments", 1)
+						}
+						newPerson, err := fpp.PersonCreate(c.Args().Get(0), "", tag, c.Args().Get(1))
+						if err != nil {
+							return cli.NewExitError(err.Error(), 1)
+						}
+						fmt.Println("created person", newPerson.Person_name, "("+newPerson.Tag+")")
+						return nil
+					},
+				},
 				{
 					Name:      "add-face",
 					Usage:     "adds a new face to a person",
@@ -71,33 +124,59 @@ func main() {
 						if c.Args().Get(0) == "" || (imageUrl == "" && imageFileLocation == "") {
 							return cli.NewExitError("not enough arguments", 1)
 						}
-						var err error
-						detectedFace := new(facepp.DetectionDetectO)
 						if imageUrl != "" {
-							detectedFace, err = fpp.DetectionDetect(imageUrl, "", "")
+							detectedFace, err := fpp.DetectionDetect(imageUrl, "", "")
 							if err != nil {
 								return cli.NewExitError(err.Error(), 1)
 							}
+							if len(detectedFace.Face) <= 0 {
+								return cli.NewExitError("unable to find face in picture", 1)
+							}
+							if len(detectedFace.Face) > 1 {
+								return cli.NewExitError("found too many faces in picture (found "+strconv.Itoa(len(detectedFace.Face))+")", 1)
+							}
+							addedFaces, err := fpp.PersonAddFace(c.Args().Get(0), detectedFace.Face[0].Face_id)
+							if err != nil {
+								return cli.NewExitError(err.Error(), 1)
+							}
+							if addedFaces.Success != true {
+								return cli.NewExitError("api error", 1)
+							}
+							fmt.Println("added", addedFaces.Added, "face to person", c.Args().Get(0))
 						} else if imageFileLocation != "" {
-							detectedFace, err = fpp.DetectionDetectFile(imageFileLocation, "", "")
+							pathes, err := filepath.Glob(imageFileLocation)
 							if err != nil {
 								return cli.NewExitError(err.Error(), 1)
 							}
+
+							// source https://gist.github.com/AntoineAugusti/80e99edfe205baf7a094
+							maxNbConcurrentGoroutines, err := cfg.Section("faceplusplus").Key("concurrent requests").Int()
+							if err != nil {
+								return cli.NewExitError(err.Error(), 1)
+							}
+							concurrentGoroutines := make(chan struct{}, maxNbConcurrentGoroutines)
+							for i := 0; i < maxNbConcurrentGoroutines; i++ {
+								concurrentGoroutines <- struct{}{}
+							}
+							done := make(chan bool)
+							waitForAllJobs := make(chan bool)
+
+							go func() {
+								for i := 0; i < len(pathes); i++ {
+									<-done
+									concurrentGoroutines <- struct{}{}
+								}
+								waitForAllJobs <- true
+							}()
+							for _, path := range pathes {
+								<-concurrentGoroutines
+								go func(path string) {
+									runAddFaceToPersonFromFile(fpp, c.Args().Get(0), path)
+									done <- true
+								}(path)
+							}
+							<-waitForAllJobs
 						}
-						if len(detectedFace.Face) <= 0 {
-							return cli.NewExitError("unable to find face in picture", 1)
-						}
-						if len(detectedFace.Face) > 1 {
-							return cli.NewExitError("found too many faces in picture (found "+strconv.Itoa(len(detectedFace.Face))+")", 1)
-						}
-						addedFaces, err := fpp.PersonAddFace(c.Args().Get(0), detectedFace.Face[0].Face_id)
-						if err != nil {
-							return cli.NewExitError(err.Error(), 1)
-						}
-						if addedFaces.Success != true {
-							return cli.NewExitError("api error", 1)
-						}
-						fmt.Println("added", addedFaces.Added, "face to person", c.Args().Get(0))
 						return nil
 					},
 				},
@@ -181,24 +260,35 @@ func main() {
 						if c.Args().Get(0) == "" {
 							return cli.NewExitError("not enough arguments", 1)
 						}
-						var err error
-						faceInfo := new(facepp.RecognitionIdentifyO)
 						if imageUrl != "" {
-							faceInfo, err = fpp.RecognitionIdentify(c.Args().Get(0), imageUrl, "oneface", "")
+							faceInfo, err := fpp.RecognitionIdentify(c.Args().Get(0), imageUrl, "oneface", "")
 							if err != nil {
 								return cli.NewExitError(err.Error(), 1)
+							}
+							if len(faceInfo.Face) <= 0 || len(faceInfo.Face[0].Candidate) <= 0 {
+								return cli.NewExitError("found no matching face", 1)
+							}
+							for _, candidate := range faceInfo.Face[0].Candidate {
+								fmt.Println("confidence", strconv.FormatFloat(candidate.Confidence, 'f', 2, 64)+"%:", "found", candidate.Person_name, "("+candidate.Tag+")")
 							}
 						} else if imageFileLocation != "" {
-							faceInfo, err = fpp.RecognitionIdentifyFile(c.Args().Get(0), imageFileLocation, "oneface", "")
+							pathes, err := filepath.Glob(imageFileLocation)
 							if err != nil {
 								return cli.NewExitError(err.Error(), 1)
 							}
-						}
-						if len(faceInfo.Face) <= 0 || len(faceInfo.Face[0].Candidate) <= 0 {
-							return cli.NewExitError("found no matching face", 1)
-						}
-						for _, candidate := range faceInfo.Face[0].Candidate {
-							fmt.Println("confidence", strconv.FormatFloat(candidate.Confidence, 'f', 2, 64)+"%:", "found", candidate.Person_name, "("+candidate.Tag+")")
+							for _, path := range pathes {
+								faceInfo, err := fpp.RecognitionIdentifyFile(c.Args().Get(0), path, "oneface", "")
+								if err != nil {
+									fmt.Println(path, "failed:", err.Error())
+								} else {
+									if len(faceInfo.Face) <= 0 || len(faceInfo.Face[0].Candidate) <= 0 {
+										return cli.NewExitError("found no matching face", 1)
+									}
+									for _, candidate := range faceInfo.Face[0].Candidate {
+										fmt.Println(path, "confidence", strconv.FormatFloat(candidate.Confidence, 'f', 2, 64)+"%:", "found", candidate.Person_name, "("+candidate.Tag+")")
+									}
+								}
+							}
 						}
 						return nil
 					},

@@ -51,16 +51,23 @@ func (fpp Facepp) Execute(method string, params map[string]string) (io.Reader, e
 	return resp.Body, err
 }
 
-func (fpp Facepp) ExecuteFileUpload(method string, params map[string]string, filepath string) (io.Reader, error) {
+func (fpp Facepp) ExecuteFileUpload(method string, params map[string]string, filepathS string) (io.Reader, error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
 
-	f, err := os.Open(filepath)
+	f, err := os.Open(filepathS)
 	if err != nil {
 		return *new(io.Reader), err
 	}
 	defer f.Close()
-	fw, err := w.CreateFormFile("img", filepath)
+	fi, err := f.Stat()
+	if err != nil {
+		return *new(io.Reader), err
+	}
+	if fi.Size() >= 3145728 {
+		return *new(io.Reader), errors.New("image filesize bigger than 3 mb")
+	}
+	fw, err := w.CreateFormFile("img", filepathS)
 	if err != nil {
 		return *new(io.Reader), err
 	}
